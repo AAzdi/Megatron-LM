@@ -437,8 +437,17 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
-        return output, context
+        mlp_result = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        
+        # Handle MoE layer returning additional routing_map
+        if isinstance(mlp_result, tuple) and len(mlp_result) >= 3:
+            # MoE layer returns (output, mlp_bias, routing_map)
+            output, mlp_bias, routing_map = mlp_result[0], mlp_result[1], mlp_result[2]
+            return output, context, routing_map
+        else:
+            # Regular MLP layer returns only output
+            output = mlp_result
+            return output, context
 
     def _forward_attention(
         self,

@@ -560,6 +560,9 @@ class TransformerBlock(MegatronModule):
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
+        # Initialize list to collect routing maps from MoE layers
+        moe_routing_maps = []
+
         with rng_context, outer_fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
@@ -573,6 +576,7 @@ class TransformerBlock(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     use_inner_fp8_context=use_inner_fp8_context,
                 )
+                # Note: routing maps not available in checkpointed mode
             else:
                 for l_no, layer in enumerate(self.layers):
                     inner_fp8_context = (
@@ -581,7 +585,7 @@ class TransformerBlock(MegatronModule):
                         else nullcontext()
                     )
                     with self.offload_context, inner_fp8_context:
-                        hidden_states, context = layer(
+                        layer_result = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             context=context,
@@ -594,6 +598,18 @@ class TransformerBlock(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
+                        
+                        # Handle different return values from transformer layers
+                        if isinstance(layer_result, tuple) and len(layer_result) >= 3:
+                            # MoE layer returns (hidden_states, context, routing_map)
+                            hidden_states, context, routing_map = layer_result[0], layer_result[1], layer_result[2]
+                            moe_routing_maps.append({
+                                'layer_number': layer.layer_number if hasattr(layer, 'layer_number') else l_no,
+                                'routing_map': routing_map
+                            })
+                        else:
+                            # Regular layer returns (hidden_states, context)
+                            hidden_states, context = layer_result
 
                     if (
                         torch.is_grad_enabled()
@@ -617,7 +633,11 @@ class TransformerBlock(MegatronModule):
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
 
-        return hidden_states
+        # Return routing maps if any MoE layers were encountered
+        if moe_routing_maps:
+            return hidden_states, moe_routing_maps
+        else:
+            return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

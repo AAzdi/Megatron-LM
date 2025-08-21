@@ -357,10 +357,18 @@ class GPTModel(LanguageModule):
         processing layer (optional).
 
         It either returns the Loss values if labels are given  or the final hidden units
+        
+        If the model contains MoE layers, it will also return routing maps for all MoE layers.
 
         Args:
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
+                
+        Returns:
+            Tensor or Tuple[Tensor, List]: If no MoE layers, returns the output tensor.
+                If MoE layers present, returns (output, moe_routing_maps) where
+                moe_routing_maps is a list of dicts containing layer_number and routing_map
+                for each MoE layer.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -376,7 +384,7 @@ class GPTModel(LanguageModule):
         )
 
         # Run decoder.
-        hidden_states = self.decoder(
+        decoder_result = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -387,8 +395,17 @@ class GPTModel(LanguageModule):
             sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
         )
+        
+        # Handle decoder return value - check if MoE routing maps are returned
+        if isinstance(decoder_result, tuple) and len(decoder_result) == 2:
+            # Decoder returned (hidden_states, moe_routing_maps)
+            hidden_states, moe_routing_maps = decoder_result
+        else:
+            # Decoder returned only hidden_states
+            hidden_states = decoder_result
+            moe_routing_maps = None
 
-        return self._postprocess(
+        result = self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
             position_ids=position_ids,
@@ -407,6 +424,12 @@ class GPTModel(LanguageModule):
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
         )
+        
+        # If we have MoE routing maps, return them along with the main result
+        if moe_routing_maps:
+            return result, moe_routing_maps
+        else:
+            return result
 
     def _postprocess(
         self,
