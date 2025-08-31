@@ -6,7 +6,7 @@ from typing import Dict, Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -27,6 +27,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
 
@@ -369,7 +370,7 @@ class GPTModel(LanguageModule):
         )
 
         # Run decoder.
-        hidden_states = self.decoder(
+        decoder_output = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -381,7 +382,14 @@ class GPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
 
-        return self._postprocess(
+        # Handle decoder output - could include router logits
+        if isinstance(decoder_output, tuple) and len(decoder_output) == 2:
+            hidden_states, all_router_logits = decoder_output
+        else:
+            hidden_states = decoder_output
+            all_router_logits = None
+
+        postprocess_output = self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
             position_ids=position_ids,
@@ -400,6 +408,46 @@ class GPTModel(LanguageModule):
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
         )
+
+        # Format router logits if present
+        if all_router_logits is not None:
+            all_router_logits = self._format_router_logits(all_router_logits, input_ids.shape[0])
+            # Add pipeline stage metadata for upper-layer handling
+            router_logits_metadata = {
+                'router_logits': all_router_logits,
+                'layer_offset': get_transformer_layer_offset(self.config),
+                'num_layers_in_stage': len(self.decoder.layers) if hasattr(self.decoder, 'layers') else 0,
+                'total_layers': self.config.num_layers,
+                'pipeline_stage': parallel_state.get_pipeline_model_parallel_rank(),
+                'is_pipeline_parallel': self.config.pipeline_model_parallel_size > 1
+            }
+            return postprocess_output, router_logits_metadata
+        else:
+            return postprocess_output, None
+
+    def _format_router_logits(self, all_router_logits, batch_size):
+        """
+        Format router logits to the desired shape [bsz, layers, seq_len, expert_num].
+        
+        Args:
+            all_router_logits: List of router logits from each layer
+            batch_size: Batch size from input_ids
+            
+        Returns:
+            torch.Tensor: Formatted router logits with shape [bsz, layers, seq_len, expert_num]
+        """
+        if not all_router_logits:
+            return None
+            
+        # Stack router logits from all layers: [layers, seq_len, bsz, expert_num]
+        stacked_logits = torch.stack(all_router_logits, dim=0)
+        
+        # Transpose to get [bsz, layers, seq_len, expert_num]
+        # Current shape: [layers, seq_len, bsz, expert_num]
+        # Target shape:  [bsz, layers, seq_len, expert_num]
+        formatted_logits = stacked_logits.permute(2, 0, 1, 3)
+        
+        return formatted_logits
 
     def _postprocess(
         self,

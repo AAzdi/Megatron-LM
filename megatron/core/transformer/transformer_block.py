@@ -374,7 +374,7 @@ class TransformerBlock(MegatronModule):
                         else nullcontext()
                     )
                     with inner_fp8_context:
-                        hidden_states, context = layer(
+                        layer_output = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             context=context,
@@ -384,6 +384,21 @@ class TransformerBlock(MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                         )
+                        
+                        # Handle different return formats from layers
+                        if isinstance(layer_output, tuple):
+                            if len(layer_output) == 2:
+                                # Standard case: (hidden_states, context)
+                                hidden_states, context = layer_output
+                            elif len(layer_output) == 3:
+                                # MoE case: (hidden_states, context, router_logits)
+                                # Note: Router logits are not collected in checkpointed mode
+                                hidden_states, context, _ = layer_output
+                            else:
+                                raise ValueError(f"Unexpected layer output format: {len(layer_output)} elements")
+                        else:
+                            # Single tensor output
+                            hidden_states = layer_output
                 return hidden_states, context
 
             return custom_forward
@@ -501,8 +516,8 @@ class TransformerBlock(MegatronModule):
                 processing.
 
         Returns:
-            Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
-            [s, b, h], and optionally the updated context tensor if cross-attention is used.
+            Union[Tensor, Tuple[Tensor, List[Tensor]]]: The output hidden states tensor of shape
+            [s, b, h], and optionally a list of router logits from MoE layers if any exist.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -546,6 +561,9 @@ class TransformerBlock(MegatronModule):
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
+        # Collect router logits from all layers
+        all_router_logits = []
+
         with rng_context, outer_fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
@@ -559,6 +577,8 @@ class TransformerBlock(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     use_inner_fp8_context=use_inner_fp8_context,
                 )
+                # Note: For checkpointed forward, router logits collection is not implemented
+                # as it would require significant changes to the checkpointing mechanism
             else:
                 for l_no, layer in enumerate(self.layers):
                     inner_fp8_context = (
@@ -567,7 +587,7 @@ class TransformerBlock(MegatronModule):
                         else nullcontext()
                     )
                     with self.offload_context, inner_fp8_context:
-                        hidden_states, context = layer(
+                        layer_output = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             context=context,
@@ -580,6 +600,21 @@ class TransformerBlock(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
+
+                    # Handle different return formats from layers
+                    if isinstance(layer_output, tuple):
+                        if len(layer_output) == 2:
+                            # Standard case: (hidden_states, context)
+                            hidden_states, context = layer_output
+                        elif len(layer_output) == 3:
+                            # MoE case: (hidden_states, context, router_logits)
+                            hidden_states, context, router_logits = layer_output
+                            all_router_logits.append(router_logits)
+                        else:
+                            raise ValueError(f"Unexpected layer output format: {len(layer_output)} elements")
+                    else:
+                        # Single tensor output
+                        hidden_states = layer_output
 
                     if (
                         torch.is_grad_enabled()
@@ -603,7 +638,11 @@ class TransformerBlock(MegatronModule):
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
 
-        return hidden_states
+        # Return router logits if any were collected
+        if all_router_logits:
+            return hidden_states, all_router_logits
+        else:
+            return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

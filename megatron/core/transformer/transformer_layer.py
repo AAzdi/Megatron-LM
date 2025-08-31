@@ -439,8 +439,15 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
-        return output, context
+        mlp_output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        
+        # Check if MLP output contains router logits (from MoE layer)
+        if isinstance(mlp_output, tuple) and len(mlp_output) == 2:
+            output, router_logits = mlp_output
+            return output, context, router_logits
+        else:
+            output = mlp_output
+            return output, context
 
     def _forward_attention(
         self,
@@ -562,6 +569,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
+            or
+            Tuple[Tensor, Tensor]: (output, router_logits) if MLP is a MoE layer.
         """
 
         # Residual connection.
@@ -609,22 +618,50 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             # Compute outputs for each chunk
             outputs = [self.mlp(chunk) for chunk in chunks]
 
-            # Aggregate chunk outputs
-            mlp_output = torch.cat([out for out, _ in outputs], dim=0)
-            bias_chunks = [bias for _, bias in outputs if bias is not None]
-            bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
-            mlp_output_with_bias = (mlp_output, bias_output)
+            # Check if outputs contain router logits (from MoE layer)
+            if isinstance(outputs[0], tuple) and len(outputs[0]) == 3:
+                # Handle MoE case with router logits
+                mlp_outputs = [out[0] for out in outputs]
+                biases = [out[1] for out in outputs if out[1] is not None]
+                router_logits = [out[2] for out in outputs]
+                
+                # Aggregate chunk outputs
+                mlp_output = torch.cat(mlp_outputs, dim=0)
+                bias_output = torch.stack(biases, dim=0).sum(dim=0) if biases else None
+                # Concatenate router logits along sequence dimension
+                combined_router_logits = torch.cat(router_logits, dim=0)
+                mlp_output_with_bias = (mlp_output, bias_output, combined_router_logits)
+            else:
+                # Handle non-MoE case
+                mlp_outputs = [out[0] if isinstance(out, tuple) else out for out in outputs]
+                biases = [out[1] if isinstance(out, tuple) and len(out) > 1 and out[1] is not None else None for out in outputs]
+                bias_chunks = [bias for bias in biases if bias is not None]
+                
+                mlp_output = torch.cat(mlp_outputs, dim=0)
+                bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
+                mlp_output_with_bias = (mlp_output, bias_output)
 
         else:
+            # Normal case: directly call MLP
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of mlp_output_with_bias[0]
-            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
-                mlp_output_with_bias[0]
-            )
+            if isinstance(mlp_output_with_bias, tuple):
+                self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+                    mlp_output_with_bias[0]
+                )
+            else:
+                self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+                    mlp_output_with_bias
+                )
         nvtx_range_pop(suffix="mlp")
+
+        # Handle router logits if present (from MoE layer)
+        router_logits = None
+        if isinstance(mlp_output_with_bias, tuple) and len(mlp_output_with_bias) == 3:
+            mlp_output_with_bias, router_logits = mlp_output_with_bias[:2], mlp_output_with_bias[2]
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -645,7 +682,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        return output
+        if router_logits is not None:
+            return output, router_logits
+        else:
+            return output
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

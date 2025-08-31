@@ -169,11 +169,11 @@ class MoELayer(BaseMoELayer):
         hidden states are returned as a residual connection.
         """
         residual = hidden_states
-        probs, routing_map = self.router(hidden_states)
+        probs, routing_map, logits = self.router(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
-        return hidden_states, probs, residual
+        return hidden_states, probs, residual, logits
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
@@ -243,17 +243,17 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
-            hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
+            hidden_states, probs, residual, logits = self.router_and_preprocess(hidden_states)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, shared_expert_output, mlp_bias = self.experts_compute(
                 dispatched_input, probs, residual
             )
             output = self.combine(output, shared_expert_output)
-            return output, mlp_bias
+            return output, mlp_bias, logits
 
         if self.moe_layer_recompute:
             if self.config.fp8:
-                output, mlp_bias = te_checkpoint(
+                output, mlp_bias, logits = te_checkpoint(
                     custom_forward,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
@@ -261,11 +261,11 @@ class MoELayer(BaseMoELayer):
                     hidden_states,
                 )
             else:
-                output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+                output, mlp_bias, logits = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
         else:
-            output, mlp_bias = custom_forward(hidden_states)
+            output, mlp_bias, logits = custom_forward(hidden_states)
 
-        return output, mlp_bias
+        return output, mlp_bias, logits
 
     def backward_dw(self):
         """Compute weight gradients for experts and shared experts."""
