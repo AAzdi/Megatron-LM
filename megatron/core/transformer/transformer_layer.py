@@ -437,17 +437,15 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        mlp_result = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        mlp_output, router_logits = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
         
-        # Handle MoE layer returning additional routing_map
-        if isinstance(mlp_result, tuple) and len(mlp_result) >= 3:
-            # MoE layer returns (output, mlp_bias, routing_map)
-            output, mlp_bias, routing_map = mlp_result[0], mlp_result[1], mlp_result[2]
-            return output, context, routing_map
+        # Return results based on whether router logits are present
+        if router_logits is not None:
+            # MoE layer with router logits
+            return mlp_output, context, router_logits
         else:
-            # Regular MLP layer returns only output
-            output = mlp_result
-            return output, context
+            # Regular MLP layer without router logits
+            return mlp_output, context
 
     def _forward_attention(
         self,
@@ -566,9 +564,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         Args:
             hidden_states (Tensor): Transformed hidden states before the MLP layernorm.
+            inference_context: Context for inference optimizations.
 
         Returns:
-            output (Tensor): Transformed hidden states of shape [s, b, h].
+            tuple: (output, router_logits) where:
+                - output (Tensor): Transformed hidden states of shape [s, b, h].
+                - router_logits (Tensor or None): Router logits from MoE layer, if present.
         """
 
         # Residual connection.
@@ -592,6 +593,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             and not isinstance(self.mlp, IdentityOp)
         )
 
+        router_logits = None  # Initialize router_logits
+
         if self.recompute_mlp:
             if self.config.fp8:
                 # import here to avoid circular import
@@ -608,6 +611,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias = tensor_parallel.checkpoint(
                     self.mlp, False, pre_mlp_layernorm_output
                 )
+            
+            # Extract router logits from checkpoint result if present
+            if isinstance(mlp_output_with_bias, tuple) and len(mlp_output_with_bias) == 3:
+                router_logits = mlp_output_with_bias[2]
+                
         elif should_chunk_mlp_for_prefill:
             # Chunk input along sequence dimension
             num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
@@ -615,15 +623,36 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
             # Compute outputs for each chunk
             outputs = [self.mlp(chunk) for chunk in chunks]
-
-            # Aggregate chunk outputs
-            mlp_output = torch.cat([out for out, _ in outputs], dim=0)
-            bias_chunks = [bias for _, bias in outputs if bias is not None]
-            bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
-            mlp_output_with_bias = (mlp_output, bias_output)
+            
+            # Check if outputs contain router logits (from MoE layer)
+            if isinstance(outputs[0], tuple) and len(outputs[0]) == 3:
+                # Handle MoE case with router logits
+                mlp_outputs = [out[0] for out in outputs]
+                biases = [out[1] for out in outputs if out[1] is not None]
+                router_logits_chunks = [out[2] for out in outputs]
+                
+                # Aggregate chunk outputs
+                mlp_output = torch.cat(mlp_outputs, dim=0)
+                bias_output = torch.stack(biases, dim=0).sum(dim=0) if biases else None
+                # Concatenate router logits along sequence dimension
+                router_logits = torch.cat(router_logits_chunks, dim=0)
+                mlp_output_with_bias = (mlp_output, bias_output, router_logits)
+            else:
+                # Handle non-MoE case
+                mlp_outputs = [out[0] if isinstance(out, tuple) else out for out in outputs]
+                biases = [out[1] if isinstance(out, tuple) and len(out) > 1 and out[1] is not None else None for out in outputs]
+                bias_chunks = [bias for bias in biases if bias is not None]
+                
+                mlp_output = torch.cat(mlp_outputs, dim=0)
+                bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
+                mlp_output_with_bias = (mlp_output, bias_output)
 
         else:
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+            
+            # Extract router logits if present
+            if isinstance(mlp_output_with_bias, tuple) and len(mlp_output_with_bias) == 3:
+                router_logits = mlp_output_with_bias[2]
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -652,7 +681,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        return output
+        return output, router_logits
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
@@ -751,12 +780,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
 
+        router_logits = None
         if self.config.cuda_graph_scope == "full":
-            hidden_states = self._forward_mlp(hidden_states)
+            mlp_output = self._forward_mlp(hidden_states)
+            if isinstance(mlp_output, tuple):
+                hidden_states, router_logits = mlp_output
+            else:
+                hidden_states = mlp_output
         cuda_graph_outputs = [hidden_states]
 
         if context is not None:
             cuda_graph_outputs.append(context)
+        if router_logits is not None:
+            cuda_graph_outputs.append(router_logits)
         return tuple(cuda_graph_outputs)
 
     def _cuda_graph_replay(self, *args, **kwargs):
@@ -839,12 +875,28 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             cuda_graph_output = cuda_graph_output[:-1]
         else:
             context = None
+        
+        # Check if router_logits is present in the cuda_graph_output
+        router_logits = None
+        if len(cuda_graph_output) > 1:
+            # If there are more than one output tensors, the last one might be router_logits
+            router_logits = cuda_graph_output[-1]
+            cuda_graph_output = cuda_graph_output[:-1]
+            
         if self.config.cuda_graph_scope == "attn":
             # CUDA Graph only covers the attention layer. Feed-forward
             # layer still goes through the normal pass.
-            output = self._forward_mlp(*cuda_graph_output)
+            mlp_output = self._forward_mlp(*cuda_graph_output)
+            if isinstance(mlp_output, tuple):
+                output, router_logits = mlp_output
+            else:
+                output = mlp_output
         else:
             output = cuda_graph_output[0]
+        
+        # Return format should match the forward method
+        if router_logits is not None:
+            return output, context, router_logits
         return output, context
 
     def __call__(self, *args, **kwargs):

@@ -388,7 +388,7 @@ class TransformerBlock(MegatronModule):
                         else nullcontext()
                     )
                     with inner_fp8_context:
-                        hidden_states, context = layer(
+                        layer_result = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             context=context,
@@ -398,6 +398,13 @@ class TransformerBlock(MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                         )
+                        # Handle layer results - in checkpointed mode we cannot collect router logits
+                        # because they may not be preserved through the checkpointing mechanism
+                        if isinstance(layer_result, tuple) and len(layer_result) >= 2:
+                            hidden_states, context = layer_result[0], layer_result[1]
+                        else:
+                            hidden_states = layer_result
+                            context = None
                 return hidden_states, context
 
             return custom_forward
@@ -515,8 +522,9 @@ class TransformerBlock(MegatronModule):
                 processing.
 
         Returns:
-            Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
-            [s, b, h], and optionally the updated context tensor if cross-attention is used.
+            Union[Tensor, Tuple[Tensor, List]]: The output hidden states tensor of shape
+            [s, b, h]. If MoE layers are present, also returns a list of router logits tensors
+            from all MoE layers in the transformer block.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -560,8 +568,8 @@ class TransformerBlock(MegatronModule):
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
-        # Initialize list to collect routing maps from MoE layers
-        moe_routing_maps = []
+        # Initialize list to collect router logits from all MoE layers
+        all_router_logits = []
 
         with rng_context, outer_fp8_context:
             # Forward pass.
@@ -576,7 +584,7 @@ class TransformerBlock(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     use_inner_fp8_context=use_inner_fp8_context,
                 )
-                # Note: routing maps not available in checkpointed mode
+                # Note: router logits not available in checkpointed mode
             else:
                 for l_no, layer in enumerate(self.layers):
                     inner_fp8_context = (
@@ -601,12 +609,10 @@ class TransformerBlock(MegatronModule):
                         
                         # Handle different return values from transformer layers
                         if isinstance(layer_result, tuple) and len(layer_result) >= 3:
-                            # MoE layer returns (hidden_states, context, routing_map)
-                            hidden_states, context, routing_map = layer_result[0], layer_result[1], layer_result[2]
-                            moe_routing_maps.append({
-                                'layer_number': layer.layer_number if hasattr(layer, 'layer_number') else l_no,
-                                'routing_map': routing_map
-                            })
+                            # MoE layer returns (hidden_states, context, router_logits)
+                            hidden_states, context, layer_router_logits = layer_result[0], layer_result[1], layer_result[2]
+                            if layer_router_logits is not None:
+                                all_router_logits.append(layer_router_logits)
                         else:
                             # Regular layer returns (hidden_states, context)
                             hidden_states, context = layer_result
@@ -633,9 +639,9 @@ class TransformerBlock(MegatronModule):
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
 
-        # Return routing maps if any MoE layers were encountered
-        if moe_routing_maps:
-            return hidden_states, moe_routing_maps
+        # Return router logits if any MoE layers were encountered
+        if len(all_router_logits) > 0:
+            return hidden_states, all_router_logits
         else:
             return hidden_states
 

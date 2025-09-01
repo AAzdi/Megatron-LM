@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -351,24 +351,23 @@ class GPTModel(LanguageModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given  or the final hidden units
         
-        If the model contains MoE layers, it will also return routing maps for all MoE layers.
+        If the model contains MoE layers, it will also return router logits.
 
         Args:
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
                 
         Returns:
-            Tensor or Tuple[Tensor, List]: If no MoE layers, returns the output tensor.
-                If MoE layers present, returns (output, moe_routing_maps) where
-                moe_routing_maps is a list of dicts containing layer_number and routing_map
-                for each MoE layer.
+            Tensor or Tuple[Tensor, Tensor]: If no MoE layers, returns the output tensor.
+                If MoE layers present, returns (output, router_logits) where
+                router_logits has shape [bsz, layers, seq_len, expert_num].
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -396,14 +395,15 @@ class GPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
         
-        # Handle decoder return value - check if MoE routing maps are returned
+        # Handle decoder return value - check if router logits are returned
         if isinstance(decoder_result, tuple) and len(decoder_result) == 2:
-            # Decoder returned (hidden_states, moe_routing_maps)
-            hidden_states, moe_routing_maps = decoder_result
+            # Decoder returned (hidden_states, router_logits_list)
+            # router_logits_list contains router logits from all MoE layers in the decoder
+            hidden_states, router_logits_list = decoder_result
         else:
             # Decoder returned only hidden_states
             hidden_states = decoder_result
-            moe_routing_maps = None
+            router_logits_list = None
 
         result = self._postprocess(
             hidden_states=hidden_states,
@@ -425,11 +425,63 @@ class GPTModel(LanguageModule):
             inference_context=inference_context,
         )
         
-        # If we have MoE routing maps, return them along with the main result
-        if moe_routing_maps:
-            return result, moe_routing_maps
+        # Process and return router logits if available
+        if router_logits_list is not None:
+            # Reshape router logits to [bsz, layers, seq_len, expert_num]
+            processed_router_logits = self._process_router_logits(router_logits_list, input_ids.shape[0])
+            return result, processed_router_logits
         else:
             return result
+
+    def _process_router_logits(self, router_logits_list, batch_size):
+        """
+        Format router logits to the desired shape [bsz, layers, seq_len, expert_num].
+        
+        Args:
+            router_logits_list: List of router logits from each layer
+            batch_size: Batch size from input_ids
+            
+        Returns:
+            torch.Tensor: Formatted router logits with shape [bsz, layers, seq_len, expert_num]
+        """
+        if not router_logits_list:
+            return None
+        
+        # Filter out None values and normalize each tensor to [seq_len, bsz, expert_num]
+        normalized_logits = []
+        for router_logits in router_logits_list:
+            if router_logits is None:
+                continue
+                
+            # Normalize to [seq_len, bsz, expert_num] format
+            if router_logits.dim() == 2:
+                # Shape: [seq_len * bsz, expert_num] -> [seq_len, bsz, expert_num]
+                seq_len = router_logits.shape[0] // batch_size
+                expert_num = router_logits.shape[1]
+                router_logits = router_logits.view(seq_len, batch_size, expert_num)
+            elif router_logits.dim() == 3:
+                # Check if it's [bsz, seq_len, expert_num] and transpose if needed
+                if router_logits.shape[0] == batch_size:
+                    # [bsz, seq_len, expert_num] -> [seq_len, bsz, expert_num]
+                    router_logits = router_logits.transpose(0, 1)
+                # else: already in [seq_len, bsz, expert_num] format
+            else:
+                raise ValueError(f"Unexpected router_logits shape: {router_logits.shape}")
+                
+            normalized_logits.append(router_logits)
+        
+        if not normalized_logits:
+            return None
+            
+        # Stack router logits from all layers: [layers, seq_len, bsz, expert_num]
+        stacked_logits = torch.stack(normalized_logits, dim=0)
+        
+        # Transpose to get [bsz, layers, seq_len, expert_num]
+        # Current shape: [layers, seq_len, bsz, expert_num]
+        # Target shape:  [bsz, layers, seq_len, expert_num]
+        formatted_logits = stacked_logits.permute(2, 0, 1, 3)
+        
+        return formatted_logits
 
     def _postprocess(
         self,
