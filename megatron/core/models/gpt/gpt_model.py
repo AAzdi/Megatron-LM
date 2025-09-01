@@ -409,19 +409,10 @@ class GPTModel(LanguageModule):
             inference_context=inference_context,
         )
 
-        # Format router logits if present
+        # Format and return router logits with consistent shape
         if all_router_logits is not None:
-            all_router_logits = self._format_router_logits(all_router_logits, input_ids.shape[0])
-            # Add pipeline stage metadata for upper-layer handling
-            router_logits_metadata = {
-                'router_logits': all_router_logits,
-                'layer_offset': get_transformer_layer_offset(self.config),
-                'num_layers_in_stage': len(self.decoder.layers) if hasattr(self.decoder, 'layers') else 0,
-                'total_layers': self.config.num_layers,
-                'pipeline_stage': parallel_state.get_pipeline_model_parallel_rank(),
-                'is_pipeline_parallel': self.config.pipeline_model_parallel_size > 1
-            }
-            return postprocess_output, router_logits_metadata
+            formatted_router_logits = self._format_router_logits(all_router_logits, input_ids.shape[0])
+            return postprocess_output, formatted_router_logits
         else:
             return postprocess_output, None
 
