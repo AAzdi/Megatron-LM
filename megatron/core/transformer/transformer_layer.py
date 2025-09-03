@@ -615,6 +615,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             # Extract router logits from checkpoint result if present
             if isinstance(mlp_output_with_bias, tuple) and len(mlp_output_with_bias) == 3:
                 router_logits = mlp_output_with_bias[2]
+                # Keep only the first two elements for bias_dropout_add
+                mlp_output_with_bias = (mlp_output_with_bias[0], mlp_output_with_bias[1])
                 
         elif should_chunk_mlp_for_prefill:
             # Chunk input along sequence dimension
@@ -636,7 +638,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 bias_output = torch.stack(biases, dim=0).sum(dim=0) if biases else None
                 # Concatenate router logits along sequence dimension
                 router_logits = torch.cat(router_logits_chunks, dim=0)
-                mlp_output_with_bias = (mlp_output, bias_output, router_logits)
+                mlp_output_with_bias = (mlp_output, bias_output)
             else:
                 # Handle non-MoE case
                 mlp_outputs = [out[0] if isinstance(out, tuple) else out for out in outputs]
@@ -653,6 +655,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             # Extract router logits if present
             if isinstance(mlp_output_with_bias, tuple) and len(mlp_output_with_bias) == 3:
                 router_logits = mlp_output_with_bias[2]
+                # Keep only the first two elements for bias_dropout_add
+                mlp_output_with_bias = (mlp_output_with_bias[0], mlp_output_with_bias[1])
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute

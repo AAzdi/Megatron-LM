@@ -427,22 +427,25 @@ class GPTModel(LanguageModule):
         
         # Process and return router logits if available
         if router_logits_list is not None:
-            # Reshape router logits to [bsz, layers, seq_len, expert_num]
+            # Reshape router logits to [bsz, seq_len, layers, expert_num]
             processed_router_logits = self._process_router_logits(router_logits_list, input_ids.shape[0])
             return result, processed_router_logits
         else:
             return result
 
     def _process_router_logits(self, router_logits_list, batch_size):
-        """
-        Format router logits to the desired shape [bsz, layers, seq_len, expert_num].
-        
+        """Format router logits to shape [bsz, seq_len, layers, expert_num] (token-major).
+
+        This ordering simplifies later packed->padded recovery since sequence becomes
+        the second dimension (matching log_probs layout) and avoids an extra permute
+        in postprocess utilities.
+
         Args:
-            router_logits_list: List of router logits from each layer
-            batch_size: Batch size from input_ids
-            
+            router_logits_list: list of per-layer router logits tensors
+            batch_size: batch size
+
         Returns:
-            torch.Tensor: Formatted router logits with shape [bsz, layers, seq_len, expert_num]
+            torch.Tensor | None: [bsz, seq_len, layers, expert_num] or None
         """
         if not router_logits_list:
             return None
@@ -472,15 +475,12 @@ class GPTModel(LanguageModule):
         
         if not normalized_logits:
             return None
-            
-        # Stack router logits from all layers: [layers, seq_len, bsz, expert_num]
+
+        # Stack router logits from all layers first: [layers, seq_len, bsz, expert_num]
         stacked_logits = torch.stack(normalized_logits, dim=0)
-        
-        # Transpose to get [bsz, layers, seq_len, expert_num]
-        # Current shape: [layers, seq_len, bsz, expert_num]
-        # Target shape:  [bsz, layers, seq_len, expert_num]
-        formatted_logits = stacked_logits.permute(2, 0, 1, 3)
-        
+        # Reorder to [bsz, seq_len, layers, expert_num]
+        formatted_logits = stacked_logits.permute(2, 1, 0, 3)
+
         return formatted_logits
 
     def _postprocess(

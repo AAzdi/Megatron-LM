@@ -180,7 +180,7 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
-        return hidden_states, probs, residual, routing_map, logits
+        return hidden_states, probs, residual, logits
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
