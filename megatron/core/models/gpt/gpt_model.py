@@ -2,6 +2,17 @@
 
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
+# 引入捕获工具
+try:
+    from megatron.core.transformer.moe.moe_layer import (
+        enable_router_logits_capture,
+        disable_router_logits_capture,
+        get_captured_router_logits,
+    )
+except Exception:
+    enable_router_logits_capture = lambda *a, **k: None
+    disable_router_logits_capture = lambda *a, **k: None
+    get_captured_router_logits = lambda *a, **k: []
 
 import torch
 from torch import Tensor
@@ -344,6 +355,9 @@ class GPTModel(LanguageModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        use_router_logits: bool = False,
+        router_logits_cpu: bool = False,
+        router_logits_detach: bool = False,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
@@ -355,6 +369,10 @@ class GPTModel(LanguageModule):
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
         """
+        if use_router_logits:
+            enable_router_logits_capture(clear=True)
+        else:
+            disable_router_logits_capture()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -380,8 +398,8 @@ class GPTModel(LanguageModule):
             sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
         )
-
-        return self._postprocess(
+    
+        result = self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
             position_ids=position_ids,
@@ -400,6 +418,41 @@ class GPTModel(LanguageModule):
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
         )
+
+        if use_router_logits:
+            router_logits_list = get_captured_router_logits(detach=router_logits_detach, cpu=router_logits_cpu)
+            router_logits = self._process_router_logits(router_logits_list)
+            return result, router_logits
+        else:
+            return result
+
+    def _process_router_logits(self, router_logits_list):
+        """Format router logits to shape [bsz, seq_len, layers, expert_num] (token-major).
+
+        This ordering simplifies later packed->padded recovery since sequence becomes
+        the second dimension (matching log_probs layout) and avoids an extra permute
+        in postprocess utilities.
+
+        Args:
+            router_logits_list: list of (layer_id, logits_tensor) tuples
+            batch_size: batch size
+
+        Returns:
+            torch.Tensor | None: [bsz, seq_len, layers, expert_num] or None
+        """
+        if not router_logits_list:
+            return None
+        
+        # Stack router logits from all layers: [layers, seq_len, bsz, expert_num]
+        stacked_logits = torch.stack(router_logits_list, dim=0)
+        
+        # Transpose to get [bsz, seq_len, layers, expert_num]
+        # Current shape: [layers, seq_len, bsz, expert_num]
+        # Target shape:  [bsz, seq_len, layers, expert_num]
+        formatted_logits = stacked_logits.permute(2, 1, 0, 3)
+        
+        return formatted_logits
+
 
     def _postprocess(
         self,

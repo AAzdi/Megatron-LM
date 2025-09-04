@@ -447,4 +447,4 @@ class TopKRouter(Router):
 
         scores, routing_map = self.routing(logits)
 
-        return scores, routing_map
+        return scores, routing_map, logits

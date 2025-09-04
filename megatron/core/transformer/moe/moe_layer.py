@@ -4,6 +4,41 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Union
 
+# ===== Router logits capture utilities (lightweight hook mechanism) =====
+# 全局开关与缓存（仅在use_router_logits=True时使用）
+_ROUTER_LOGITS_CAPTURE: bool = False
+_CAPTURED_ROUTER_LOGITS: list = []  # 每项: (layer_number, tensor[ num_tokens, num_experts ])
+
+def enable_router_logits_capture(clear: bool = True):
+    """开启router logits捕获。在GPTModel.forward传入use_router_logits=True时调用。"""
+    global _ROUTER_LOGITS_CAPTURE, _CAPTURED_ROUTER_LOGITS
+    _ROUTER_LOGITS_CAPTURE = True
+    if clear:
+        _CAPTURED_ROUTER_LOGITS.clear()
+
+def disable_router_logits_capture():
+    """关闭捕获。"""
+    global _ROUTER_LOGITS_CAPTURE
+    _ROUTER_LOGITS_CAPTURE = False
+
+def get_captured_router_logits(detach: bool = False, cpu: bool = False):
+    """获取捕获到的所有layer的router logits。
+    Args:
+        detach: 返回前是否detach，避免梯度跟踪。
+        cpu: 是否转移到CPU（大量层时可降低显存占用）。
+    Returns:
+        list[ (layer_number:int, logits:Tensor) ]
+    """
+    out = []
+    for layer_id, t in _CAPTURED_ROUTER_LOGITS:
+        tt = t
+        if detach:
+            tt = tt.detach()
+        if cpu:
+            tt = tt.to('cpu')
+        out.append((layer_id, tt))
+    return out
+
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
@@ -169,7 +204,12 @@ class MoELayer(BaseMoELayer):
         hidden states are returned as a residual connection.
         """
         residual = hidden_states
-        probs, routing_map = self.router(hidden_states)
+        # probs, routing_map, logits = self.router(hidden_states)
+        probs, routing_map, logits = self.router(hidden_states)
+        # 记录router logits（只在开关打开时）
+        if _ROUTER_LOGITS_CAPTURE:
+            # 仅保存必要tensor引用；不clone以减少额外显存（用户如需持久化可在外部detach/cpu）
+            _CAPTURED_ROUTER_LOGITS.append((self.layer_number, logits))
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
