@@ -424,11 +424,12 @@ class GPTModel(LanguageModule):
         
         if use_router_logits:
             router_logits_list = get_captured_router_logits(detach=router_logits_detach, cpu=router_logits_cpu)
-            return result, router_logits_list
+            router_logits = self._process_router_logits(router_logits_list)
+            return result, router_logits
         else:
             return result
 
-    def _process_router_logits(self, router_logits_list, batch_size):
+    def _process_router_logits(self, router_logits_list):
         """Format router logits to shape [bsz, seq_len, layers, expert_num] (token-major).
 
         This ordering simplifies later packed->padded recovery since sequence becomes
@@ -436,7 +437,7 @@ class GPTModel(LanguageModule):
         in postprocess utilities.
 
         Args:
-            router_logits_list: list of per-layer router logits tensors
+            router_logits_list: list of (layer_id, logits_tensor) tuples
             batch_size: batch size
 
         Returns:
@@ -445,38 +446,16 @@ class GPTModel(LanguageModule):
         if not router_logits_list:
             return None
         
-        # Filter out None values and normalize each tensor to [seq_len, bsz, expert_num]
-        normalized_logits = []
-        for router_logits in router_logits_list:
-            if router_logits is None:
-                continue
-                
-            # Normalize to [seq_len, bsz, expert_num] format
-            if router_logits.dim() == 2:
-                # Shape: [seq_len * bsz, expert_num] -> [seq_len, bsz, expert_num]
-                seq_len = router_logits.shape[0] // batch_size
-                expert_num = router_logits.shape[1]
-                router_logits = router_logits.view(seq_len, batch_size, expert_num)
-            elif router_logits.dim() == 3:
-                # Check if it's [bsz, seq_len, expert_num] and transpose if needed
-                if router_logits.shape[0] == batch_size:
-                    # [bsz, seq_len, expert_num] -> [seq_len, bsz, expert_num]
-                    router_logits = router_logits.transpose(0, 1)
-                # else: already in [seq_len, bsz, expert_num] format
-            else:
-                raise ValueError(f"Unexpected router_logits shape: {router_logits.shape}")
-                
-            normalized_logits.append(router_logits)
+        # Stack router logits from all layers: [layers, seq_len, bsz, expert_num]
+        stacked_logits = torch.stack(router_logits_list, dim=0)
         
-        if not normalized_logits:
-            return None
-
-        # Stack router logits from all layers first: [layers, seq_len, bsz, expert_num]
-        stacked_logits = torch.stack(normalized_logits, dim=0)
-        # Reorder to [bsz, seq_len, layers, expert_num]
+        # Transpose to get [bsz, seq_len, layers, expert_num]
+        # Current shape: [layers, seq_len, bsz, expert_num]
+        # Target shape:  [bsz, seq_len, layers, expert_num]
         formatted_logits = stacked_logits.permute(2, 1, 0, 3)
-
+        
         return formatted_logits
+
 
     def _postprocess(
         self,
