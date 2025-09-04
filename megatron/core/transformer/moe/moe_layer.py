@@ -4,6 +4,41 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Union
 
+# ===== Router logits capture utilities (lightweight hook mechanism) =====
+# 全局开关与缓存（仅在use_router_logits=True时使用）
+_ROUTER_LOGITS_CAPTURE: bool = False
+_CAPTURED_ROUTER_LOGITS: list = []  # 每项: (layer_number, tensor[ num_tokens, num_experts ])
+
+def enable_router_logits_capture(clear: bool = True):
+    """开启router logits捕获。在GPTModel.forward传入use_router_logits=True时调用。"""
+    global _ROUTER_LOGITS_CAPTURE, _CAPTURED_ROUTER_LOGITS
+    _ROUTER_LOGITS_CAPTURE = True
+    if clear:
+        _CAPTURED_ROUTER_LOGITS.clear()
+
+def disable_router_logits_capture():
+    """关闭捕获。"""
+    global _ROUTER_LOGITS_CAPTURE
+    _ROUTER_LOGITS_CAPTURE = False
+
+def get_captured_router_logits(detach: bool = False, cpu: bool = False):
+    """获取捕获到的所有layer的router logits。
+    Args:
+        detach: 返回前是否detach，避免梯度跟踪。
+        cpu: 是否转移到CPU（大量层时可降低显存占用）。
+    Returns:
+        list[ (layer_number:int, logits:Tensor) ]
+    """
+    out = []
+    for layer_id, t in _CAPTURED_ROUTER_LOGITS:
+        tt = t
+        if detach:
+            tt = tt.detach()
+        if cpu:
+            tt = tt.to('cpu')
+        out.append((layer_id, tt))
+    return out
+
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
@@ -171,16 +206,16 @@ class MoELayer(BaseMoELayer):
         hidden states are returned as a residual connection.
         """
         residual = hidden_states
-        ## Here comes the routing step. Return the routing map and probabilities.
-        ## routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
-        ## indicating which experts were selected for each token. True values represent
-        ## the selected experts.
-
+        # probs, routing_map, logits = self.router(hidden_states)
         probs, routing_map, logits = self.router(hidden_states)
+        # 记录router logits（只在开关打开时）
+        if _ROUTER_LOGITS_CAPTURE:
+            # 仅保存必要tensor引用；不clone以减少额外显存（用户如需持久化可在外部detach/cpu）
+            _CAPTURED_ROUTER_LOGITS.append((self.layer_number, logits))
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
-        return hidden_states, probs, residual, logits
+        return hidden_states, probs, residual
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
@@ -250,17 +285,17 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
-            hidden_states, probs, residual, logits = self.router_and_preprocess(hidden_states)
+            hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, shared_expert_output, mlp_bias = self.experts_compute(
                 dispatched_input, probs, residual
             )
             output = self.combine(output, shared_expert_output)
-            return output, mlp_bias, logits
+            return output, mlp_bias
 
         if self.moe_layer_recompute:
             if self.config.fp8:
-                output, mlp_bias, logits = te_checkpoint(
+                output, mlp_bias = te_checkpoint(
                     custom_forward,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
@@ -268,11 +303,11 @@ class MoELayer(BaseMoELayer):
                     hidden_states,
                 )
             else:
-                output, mlp_bias, logits = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+                output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
         else:
-            output, mlp_bias, logits = custom_forward(hidden_states)
+            output, mlp_bias = custom_forward(hidden_states)
 
-        return output, mlp_bias, logits
+        return output, mlp_bias
 
     def backward_dw(self):
         """Compute weight gradients for experts and shared experts."""

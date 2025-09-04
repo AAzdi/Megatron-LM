@@ -568,9 +568,6 @@ class TransformerBlock(MegatronModule):
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
-        # Initialize list to collect router logits from all MoE layers
-        all_router_logits = []
-
         with rng_context, outer_fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
@@ -593,7 +590,7 @@ class TransformerBlock(MegatronModule):
                         else nullcontext()
                     )
                     with self.offload_context, inner_fp8_context:
-                        layer_result = layer(
+                        hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             context=context,
@@ -606,16 +603,6 @@ class TransformerBlock(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
-                        
-                        # Handle different return values from transformer layers
-                        if isinstance(layer_result, tuple) and len(layer_result) >= 3:
-                            # MoE layer returns (hidden_states, context, router_logits)
-                            hidden_states, context, layer_router_logits = layer_result[0], layer_result[1], layer_result[2]
-                            if layer_router_logits is not None:
-                                all_router_logits.append(layer_router_logits)
-                        else:
-                            # Regular layer returns (hidden_states, context)
-                            hidden_states, context = layer_result
 
                     if (
                         torch.is_grad_enabled()
@@ -639,11 +626,7 @@ class TransformerBlock(MegatronModule):
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
 
-        # Return router logits if any MoE layers were encountered
-        if len(all_router_logits) > 0:
-            return hidden_states, all_router_logits
-        else:
-            return hidden_states
+        return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

@@ -2,6 +2,17 @@
 
 from collections import OrderedDict
 from typing import Dict, Literal, Optional, Tuple, Union
+# 引入捕获工具
+try:
+    from megatron.core.transformer.moe.moe_layer import (
+        enable_router_logits_capture,
+        disable_router_logits_capture,
+        get_captured_router_logits,
+    )
+except Exception:
+    enable_router_logits_capture = lambda *a, **k: None
+    disable_router_logits_capture = lambda *a, **k: None
+    get_captured_router_logits = lambda *a, **k: []
 
 import torch
 from torch import Tensor
@@ -351,26 +362,22 @@ class GPTModel(LanguageModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        use_router_logits: bool = False,
+        router_logits_cpu: bool = False,
+        router_logits_detach: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        """Forward function of the GPT Model This function passes the input tensors
-        through the embedding layer, and then the decoeder and finally into the post
-        processing layer (optional).
-
-        It either returns the Loss values if labels are given  or the final hidden units
-        
-        If the model contains MoE layers, it will also return router logits.
-
+        """GPT forward.
         Args:
-            runtime_gather_output (bool): Gather output at runtime. Default None means
-                `parallel_output` arg in the constructor will be used.
-                
+            use_router_logits: 若为True, 额外返回 (list[(layer_id, logits)])
+            router_logits_cpu: 捕获后是否转CPU
+            router_logits_detach: 是否detach返回
         Returns:
-            Tensor or Tuple[Tensor, Tensor]: If no MoE layers, returns the output tensor.
-                If MoE layers present, returns (output, router_logits) where
-                router_logits has shape [bsz, layers, seq_len, expert_num].
+            hidden_states 或 (hidden_states, router_logits_list)
         """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
+        if use_router_logits:
+            enable_router_logits_capture(clear=True)
+        else:
+            disable_router_logits_capture()
 
         decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
             self._preprocess(
@@ -383,7 +390,7 @@ class GPTModel(LanguageModule):
         )
 
         # Run decoder.
-        decoder_result = self.decoder(
+        hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -394,16 +401,6 @@ class GPTModel(LanguageModule):
             sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
         )
-        
-        # Handle decoder return value - check if router logits are returned
-        if isinstance(decoder_result, tuple) and len(decoder_result) == 2:
-            # Decoder returned (hidden_states, router_logits_list)
-            # router_logits_list contains router logits from all MoE layers in the decoder
-            hidden_states, router_logits_list = decoder_result
-        else:
-            # Decoder returned only hidden_states
-            hidden_states = decoder_result
-            router_logits_list = None
 
         result = self._postprocess(
             hidden_states=hidden_states,
@@ -425,11 +422,9 @@ class GPTModel(LanguageModule):
             inference_context=inference_context,
         )
         
-        # Process and return router logits if available
-        if router_logits_list is not None:
-            # Reshape router logits to [bsz, seq_len, layers, expert_num]
-            processed_router_logits = self._process_router_logits(router_logits_list, input_ids.shape[0])
-            return result, processed_router_logits
+        if use_router_logits:
+            router_logits_list = get_captured_router_logits(detach=router_logits_detach, cpu=router_logits_cpu)
+            return result, router_logits_list
         else:
             return result
 
