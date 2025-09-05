@@ -36,7 +36,7 @@ def get_captured_router_logits(detach: bool = False, cpu: bool = False):
             tt = tt.detach()
         if cpu:
             tt = tt.to('cpu')
-        out.append((layer_id, tt))
+        out.append(tt)
     return out
 
 import torch
