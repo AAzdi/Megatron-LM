@@ -368,14 +368,48 @@ class GPTModel(LanguageModule):
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """GPT forward.
         Args:
-            use_router_logits: 若为True, 额外返回 (list[(layer_id, logits)])
+            use_router_logits: 若为True, 额外返回 [bsz, seq_len, num_layers, num_experts] tensor
             router_logits_cpu: 捕获后是否转CPU
             router_logits_detach: 是否detach返回
         Returns:
-            hidden_states 或 (hidden_states, router_logits_list)
+            hidden_states 或 (hidden_states, router_logits_tensor)
         """
         if use_router_logits:
-            enable_router_logits_capture(clear=True)
+            # 预分配缓冲区 - 从输入张量推断维度
+            real_batch_size = input_ids.shape[0] if input_ids is not None else decoder_input.shape[0]
+            orig_seq_len = input_ids.shape[1] if input_ids is not None else decoder_input.shape[1]
+            num_layers = self.config.num_layers
+            num_experts = getattr(self.config, 'num_moe_experts', 8)
+            
+            if packed_seq_params is not None:
+                try:
+                    # packed 模式：使用实际去padding后的token数
+                    packed_total_tokens = int(packed_seq_params.cu_seqlens_q_padded[-1].item())
+                except Exception:
+                    packed_total_tokens = orig_seq_len
+                # packed 模式下batch折叠成1，seq_len是实际token数（无padding）
+                cap_batch = 1  
+                cap_seq_len = packed_total_tokens
+            else:
+                # 非packed：保持原batch和padded序列长度
+                cap_batch = real_batch_size
+                cap_seq_len = orig_seq_len
+                
+            device = (input_ids.device if input_ids is not None else decoder_input.device)
+            # 选取捕获 dtype（保持与路由计算 dtype 一致即可）
+            from torch import float16, bfloat16
+            params_dtype = getattr(self.config, 'params_dtype', bfloat16)
+            dtype = float16 if params_dtype == float16 else bfloat16
+            # print(f"启用router logits捕获: capture_batch={cap_batch}, capture_seq={cap_seq_len}, real_batch={real_batch_size}, orig_padded_seq={orig_seq_len}, L={num_layers}, E={num_experts}, packed_mode={packed_seq_params is not None}")
+            enable_router_logits_capture(
+                num_layers=num_layers,
+                batch_size=cap_batch,
+                seq_len=cap_seq_len,
+                num_experts=num_experts,
+                device=device,
+                dtype=dtype,
+                clear=True,
+            )
         else:
             disable_router_logits_capture()
 
@@ -423,38 +457,13 @@ class GPTModel(LanguageModule):
         )
         
         if use_router_logits:
-            router_logits_list = get_captured_router_logits(detach=router_logits_detach, cpu=router_logits_cpu)
-            router_logits = self._process_router_logits(router_logits_list)
+            # 直接获取预分配的 [bsz, seq_len, num_layers, num_experts] tensor
+            router_logits = get_captured_router_logits(detach=router_logits_detach, cpu=router_logits_cpu)
+            disable_router_logits_capture()  # 清理资源
             return result, router_logits
         else:
             return result
 
-    def _process_router_logits(self, router_logits_list):
-        """Format router logits to shape [bsz, seq_len, layers, expert_num] (token-major).
-
-        This ordering simplifies later packed->padded recovery since sequence becomes
-        the second dimension (matching log_probs layout) and avoids an extra permute
-        in postprocess utilities.
-
-        Args:
-            router_logits_list: list of (layer_id, logits_tensor) tuples
-            batch_size: batch size
-
-        Returns:
-            torch.Tensor | None: [bsz, seq_len, layers, expert_num] or None
-        """
-        if not router_logits_list:
-            return None
-        
-        # Stack router logits from all layers: [layers, seq_len, bsz, expert_num]
-        stacked_logits = torch.stack(router_logits_list, dim=0)
-        
-        # Transpose to get [bsz, seq_len, layers, expert_num]
-        # Current shape: [layers, seq_len, bsz, expert_num]
-        # Target shape:  [bsz, seq_len, layers, expert_num]
-        formatted_logits = stacked_logits.permute(2, 1, 0, 3)
-        
-        return formatted_logits
 
 
     def _postprocess(

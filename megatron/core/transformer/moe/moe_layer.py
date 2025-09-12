@@ -1,43 +1,95 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
+import torch
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Union
 
-# ===== Router logits capture utilities (lightweight hook mechanism) =====
-# 全局开关与缓存（仅在use_router_logits=True时使用）
+# ===== Router logits capture utilities (optimized pre-allocated buffer) =====
+# 全局开关与预分配缓冲区（仅在use_router_logits=True时使用）
 _ROUTER_LOGITS_CAPTURE: bool = False
-_CAPTURED_ROUTER_LOGITS: list = []  # 每项: (layer_number, tensor[ num_tokens, num_experts ])
+_ROUTER_LOGITS_BUFFER: Optional[torch.Tensor] = None  # 预分配: [num_layers, bsz, seq_len, num_experts]
+_BUFFER_LAYER_COUNT: int = 0  # 已写入的层数
 
-def enable_router_logits_capture(clear: bool = True):
-    """开启router logits捕获。在GPTModel.forward传入use_router_logits=True时调用。"""
-    global _ROUTER_LOGITS_CAPTURE, _CAPTURED_ROUTER_LOGITS
+def enable_router_logits_capture(
+    num_layers: int, 
+    batch_size: int, 
+    seq_len: int, 
+    num_experts: int, 
+    device: torch.device, 
+    dtype: torch.dtype = torch.float16,
+    clear: bool = True
+):
+    """开启router logits捕获，预分配缓冲区。
+    Args:
+        num_layers: 总层数
+        batch_size: 批次大小  
+        seq_len: 序列长度
+        num_experts: 专家数量
+        device: 设备
+        dtype: 数据类型，建议 fp16/bf16 节省内存
+        clear: 是否清空计数器
+    """
+    global _ROUTER_LOGITS_CAPTURE, _ROUTER_LOGITS_BUFFER, _BUFFER_LAYER_COUNT
     _ROUTER_LOGITS_CAPTURE = True
+    _ROUTER_LOGITS_BUFFER = torch.empty(
+        num_layers, batch_size, seq_len, num_experts, 
+        device=device, dtype=dtype
+    )
     if clear:
-        _CAPTURED_ROUTER_LOGITS.clear()
+        _BUFFER_LAYER_COUNT = 0
 
 def disable_router_logits_capture():
-    """关闭捕获。"""
-    global _ROUTER_LOGITS_CAPTURE
+    """关闭捕获并清理缓冲区。"""
+    global _ROUTER_LOGITS_CAPTURE, _ROUTER_LOGITS_BUFFER, _BUFFER_LAYER_COUNT
     _ROUTER_LOGITS_CAPTURE = False
+    _ROUTER_LOGITS_BUFFER = None
+    _BUFFER_LAYER_COUNT = 0
 
-def get_captured_router_logits(detach: bool = False, cpu: bool = False):
-    """获取捕获到的所有layer的router logits。
+def get_captured_router_logits(detach: bool = True, cpu: bool = False):
+    """获取捕获到的router logits，返回 [bsz, seq_len, num_layers, num_experts] 格式。
     Args:
-        detach: 返回前是否detach，避免梯度跟踪。
-        cpu: 是否转移到CPU（大量层时可降低显存占用）。
+        detach: 返回前是否detach，避免梯度跟踪
+        cpu: 是否转移到CPU
     Returns:
-        list[ (layer_number:int, logits:Tensor) ]
+        torch.Tensor: [batch_size, seq_len, num_layers, num_experts]
     """
-    out = []
-    for layer_id, t in _CAPTURED_ROUTER_LOGITS:
-        tt = t
-        if detach:
-            tt = tt.detach()
-        if cpu:
-            tt = tt.to('cpu')
-        out.append(tt)
-    return out
+    global _ROUTER_LOGITS_BUFFER, _BUFFER_LAYER_COUNT
+    if _ROUTER_LOGITS_BUFFER is None:
+        return torch.empty(0, 0, 0, 0)
+    
+    # 只返回已写入的层: [written_layers, B, T, E] -> [B, T, written_layers, E]
+    result = _ROUTER_LOGITS_BUFFER[:_BUFFER_LAYER_COUNT].permute(1, 2, 0, 3)
+    
+    if detach:
+        result = result.detach()
+    if cpu:
+        result = result.cpu()
+    
+    return result.contiguous()
+
+def _capture_router_logits(layer_number: int, logits: torch.Tensor):
+    """写入已标准化 (B,T,E) logits。"""
+    global _ROUTER_LOGITS_BUFFER, _BUFFER_LAYER_COUNT
+    if _ROUTER_LOGITS_BUFFER is not None and _ROUTER_LOGITS_CAPTURE:
+        with torch.no_grad():
+            # 确保layer_number在有效范围内 (0-based indexing)
+            if layer_number >= _ROUTER_LOGITS_BUFFER.shape[0]:
+                # layer_number可能从1开始，转换为0-based
+                layer_idx = layer_number - 1 if layer_number > 0 else layer_number
+                if layer_idx >= _ROUTER_LOGITS_BUFFER.shape[0] or layer_idx < 0:
+                    raise RuntimeError(
+                        f"Layer number {layer_number} (idx={layer_idx}) out of bounds for buffer with {_ROUTER_LOGITS_BUFFER.shape[0]} layers"
+                    )
+            else:
+                layer_idx = layer_number
+            
+            target = _ROUTER_LOGITS_BUFFER[layer_idx]
+            if logits.shape != target.shape:
+                raise RuntimeError(
+                    f"Router logits canonical shape mismatch layer={layer_number} (idx={layer_idx}): got {tuple(logits.shape)} expected {tuple(target.shape)}"
+                )
+            target.copy_(logits, non_blocking=True)
+            _BUFFER_LAYER_COUNT = max(_BUFFER_LAYER_COUNT, layer_idx + 1)
 
 import torch
 
@@ -208,10 +260,27 @@ class MoELayer(BaseMoELayer):
         residual = hidden_states
         # probs, routing_map, logits = self.router(hidden_states)
         probs, routing_map, logits = self.router(hidden_states)
-        # 记录router logits（只在开关打开时）
+        # ---- 标准化 logits 形状为 (B,T,E) ----
+        # 可能输入 (T,B,E) / (T,1,E) / (T,E) / (B,T,E)
+        if logits.dim() == 2:
+            # (T,E) -> (1,T,E)
+            logits = logits.unsqueeze(0)
+        elif logits.dim() == 3:
+            # 明确检查 (T,1,E) -> (1,T,E) 的情况
+            if logits.shape[1] == 1 and logits.shape[0] > 1:
+                # (T,1,E) -> (1,T,E)
+                logits = logits.permute(1,0,2).contiguous()
+            elif logits.shape[0] > 1 and logits.shape[1] > 1:
+                # 可能是 (T,B,E) -> (B,T,E) 或已经是 (B,T,E)
+                # 根据 hidden_states 的 batch 维判断
+                if logits.shape[1] == hidden_states.shape[0]:
+                    # (T,B,E) -> permute
+                    logits = logits.permute(1,0,2).contiguous()
+                # 否则假设已是 (B,T,E)
+            # 其他情况（如已是 (1,T,E)）直接通过
+        # 捕获
         if _ROUTER_LOGITS_CAPTURE:
-            # 仅保存必要tensor引用；不clone以减少额外显存（用户如需持久化可在外部detach/cpu）
-            _CAPTURED_ROUTER_LOGITS.append((self.layer_number, logits))
+            _capture_router_logits(self.layer_number, logits)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
